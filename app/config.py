@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./app.db"
     auto_create_tables: bool = True
     llm_enabled: bool = False
+    test_mode: bool = False
+    max_run_seconds: float = Field(default=180, gt=0, le=86400)
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
     ollama_retries: int = Field(default=1, ge=0, le=3)
@@ -29,7 +31,19 @@ class Settings(BaseSettings):
     request_timeout: float = Field(default=15, gt=0, le=120)
     ollama_timeout: float = Field(default=60, gt=0, le=300)
     max_page_bytes: int = Field(default=2_000_000, ge=1000)
+    default_delivery_region: str = "Санкт-Петербург"
+    page_archive_path: Path = ROOT / "tmp/page_archive"
+    max_page_archive_bytes: int = Field(default=500_000_000, ge=1000)
+    max_related_pages: int = Field(default=3, ge=0, le=10)
+    relevance_chunk_chars: int = Field(default=10000, ge=1000, le=20000)
+    max_relevance_chunks_per_page: int = Field(default=30, ge=1, le=200)
+    relevance_context_chars: int = Field(default=24000, ge=2000, le=60000)
+    relevance_context_tokens: int = Field(default=32768, ge=4096, le=131072)
     max_upload_bytes: int = Field(default=5_000_000, ge=1000)
+    max_enrichment_upload_bytes: int = Field(default=512_000_000, ge=1000)
+    max_enrichment_suppliers: int = Field(default=1000, ge=1)
+    max_enrichment_records: int = Field(default=100_000, ge=1)
+    max_enrichment_pages_per_supplier: int = Field(default=4, ge=1, le=100)
     candidate_text_min_similarity: float = Field(default=0.08, gt=0, le=1)
     unknown_ratio_threshold: float = Field(default=0.5, ge=0, le=1)
     confirmed_weight: float = Field(default=1.0, gt=0, allow_inf_nan=False)

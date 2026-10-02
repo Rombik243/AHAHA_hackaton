@@ -18,7 +18,7 @@ from app.schemas.candidates import CandidateRunResults
 from app.schemas.result import RunResultsOut
 from app.schemas.run import RunCreated, RunStatus
 from app.schemas.supplier_search import CANDIDATE_MODES
-from app.services.exporter import export_candidates, export_results, export_supplier_pool
+from app.services.exporter import export_candidates, export_results, export_supplier_pool, export_offers
 from app.services.dataset_parser import parse_dataset
 
 router = APIRouter(prefix="/runs", tags=["Runs"])
@@ -52,6 +52,7 @@ async def create_run(
     tru: Annotated[UploadFile | None, File(description="ТРУ: lot_id;product_name;okpd2_code")] = None,
     suppliers: Annotated[UploadFile | None, File(description="Необязательно: исторические участия lot_id;supplier_inn;supplier_kpp;is_winner. Без файла ищутся новые компании в интернете.")] = None,
     target_lot_ids: Annotated[str | None, Form(description='Optional JSON string array, e.g. ["001"]. Default: all notices.')] = None,
+    region: Annotated[str | None, Form(description="Регион поставки; пусто = DEFAULT_DELIVERY_REGION")] = None,
 ) -> RunCreated:
     mode = settings.web_search_provider
     if any(upload is not None for upload in (notices, tru, suppliers)):
@@ -65,10 +66,13 @@ async def create_run(
         for name, upload in required_uploads:
             uploads[name] = await _read_upload(upload, settings, csv_only=True)
         try:
-            selected = json.loads(target_lot_ids) if target_lot_ids is not None else None
-            if target_lot_ids is not None and not isinstance(selected, list):
+            selected = json.loads(target_lot_ids) if target_lot_ids and target_lot_ids.strip() else None
+            if target_lot_ids and target_lot_ids.strip() and not isinstance(selected, list):
                 raise ValueError("target_lot_ids must be a JSON array of string lot IDs")
             dataset = await asyncio.to_thread(parse_dataset, uploads, selected)
+            if region and region.strip():
+                for notice in dataset.notices:
+                    notice.delivery_region = region.strip()
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         filename = uploads["notices"][0]
@@ -107,14 +111,22 @@ async def get_results(run_id: int, session: Session) -> RunResultsOut | Candidat
     return RunResultsOut.model_validate(result)
 
 
-@router.get("/{run_id}/export", response_class=Response)
-async def export_run(run_id: int, session: Session, layout: Literal["pool", "matches"] | None = None) -> Response:
+@router.get("/{run_id}/export", response_class=Response,
+            description="Новый поиск: по умолчанию relevant — только подтверждённые предложения; audit — остальные статусы; "
+                        "offers — все решения. pool/matches сохраняют старый формат кандидатов, без гарантии релевантности. "
+                        "CSV ';', UTF-8 BOM; вложенные поля JSON, неизвестное null, списки [].")
+async def export_run(run_id: int, session: Session, layout: Literal["pool", "matches", "relevant", "audit", "offers"] | None = None) -> Response:
     result = await get_results(run_id, session)
-    if result.run.status != "completed":
+    partial_candidate_run = (isinstance(result, CandidateRunResults) and result.relevance is not None
+                             and result.run.stage == "timed_out")
+    if result.run.status != "completed" and not partial_candidate_run:
         raise HTTPException(409, "Export is available only for completed runs")
     if isinstance(result, CandidateRunResults):
-        pooled = layout == "pool" or (layout is None and result.run.mode == "suppliers_bulk")
-        content = export_supplier_pool(result) if pooled else export_candidates(result)
+        if layout in {"relevant", "audit", "offers"} or (layout is None and result.relevance is not None):
+            content = export_offers(result, layout or "relevant")
+        else:
+            pooled = layout == "pool" or (layout is None and result.run.mode in {"suppliers_bulk", "suppliers_enrich"})
+            content = export_supplier_pool(result) if pooled else export_candidates(result)
     else:
         if layout is not None:
             raise HTTPException(422, "layout is available only for candidate discovery runs")
@@ -124,3 +136,21 @@ async def export_run(run_id: int, session: Session, layout: Literal["pool", "mat
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="run-{run_id}.csv"'},
     )
+
+
+@router.get("/{run_id}/pages/{page_id}", tags=["Runs"],
+            summary="Сохранённый текст/JSON-LD страницы и точные фрагменты для аудита")
+async def get_page_archive(run_id: int, page_id: str, session: Session, settings: Configuration):
+    from app.services.offer_pages import read_archive
+    result = await get_results(run_id, session)
+    pages = result.relevance.pages if isinstance(result, CandidateRunResults) and result.relevance else []
+    page = next((p for p in pages if p.page_id == page_id), None)
+    if page is None:
+        raise HTTPException(404, "Page not found in this run")
+    if page.status != "loaded":
+        raise HTTPException(409, page.error or "Page was not loaded")
+    try:
+        document = await asyncio.to_thread(read_archive, page, settings)
+    except (OSError, ValueError):
+        raise HTTPException(410, "Archived page unavailable or damaged")
+    return {"page": page.model_dump(mode="json"), "document": document}

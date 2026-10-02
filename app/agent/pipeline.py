@@ -10,7 +10,7 @@ from app.config import Settings, get_settings
 from app.repositories import results as result_repository
 from app.repositories import runs as run_repository
 from app.repositories import candidates as candidate_repository
-from app.schemas.candidates import ProcurementDataset
+from app.schemas.candidates import NoticeWithTru, ProcurementDataset
 from app.schemas.domain import CompanyCandidate, ParsedLot
 from app.schemas.supplier_search import CANDIDATE_MODES
 from app.services.candidate_pool import merge_candidate_groups
@@ -23,6 +23,8 @@ from app.services.ranking import rank_candidates
 from app.services.requirement_checker import check_requirements
 from app.services.web_search import create_web_search_provider, generate_search_queries
 from app.services.candidate_search import discover_web_candidates, find_candidates
+from app.services.supplier_enrichment import enrich_suppliers
+from app.services.offer_search import discover_offers, prepare_targets
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,30 @@ class ProcurementPipeline:
             logger.info("Run %s: %s (%s%%)", run_id, values["stage"], values.get("progress", "?"))
 
     async def run(self, run_id: int) -> None:
+        if not self.settings.test_mode:
+            await self._run_with_lock(run_id)
+            return
+        try:
+            # Encloses lock wait and the complete run, not just one Ollama request.
+            async with asyncio.timeout(self.settings.max_run_seconds):
+                await self._run_with_lock(run_id)
+        except TimeoutError:
+            async with self.sessions() as session:
+                run = await run_repository.get_run(session, run_id)
+                if run is None:
+                    return
+                warnings = list(run.warnings or [])
+                message = (f"MAX_RUN_SECONDS={self.settings.max_run_seconds:g} reached. "
+                           "Processing stopped; results contain data saved so far and may be partial.")
+                if message not in warnings:
+                    warnings.append(message)
+                progress = run.progress
+            # A deadline stops this run and leaves the API worker alive. Publish
+            # the last committed checkpoint as a ready, explicitly partial result.
+            await self._update(run_id, status="completed", stage="partial_timeout", progress=progress,
+                               error=None, finished_at=datetime.now(timezone.utc), warnings=warnings)
+
+    async def _run_with_lock(self, run_id: int) -> None:
         async with self._lock:
             warnings: list[str] = []
             try:
@@ -54,15 +80,35 @@ class ProcurementPipeline:
                 await self._update(run_id, status="processing", stage="parsing", progress=5)
                 if mode in CANDIDATE_MODES:
                     dataset = ProcurementDataset.model_validate_json(content)
+                    if mode == "suppliers_enrich":
+                        async def save_enrichment(result, current_warnings, processed):
+                            nonlocal warnings
+                            warnings = list(current_warnings)
+                            async with self.sessions() as session:
+                                await candidate_repository.save_candidates(session, run_id, result)
+                            await self._update(run_id, stage="supplier_enrichment",
+                                               progress=10 + int(80 * processed / max(1, len(result.candidates))),
+                                               warnings=warnings)
+
+                        await enrich_suppliers(dataset, self.settings, save_enrichment)
+                        await self._update(run_id, status="completed", stage="completed", progress=100,
+                                           finished_at=datetime.now(timezone.utc), warnings=warnings)
+                        return
+                    prepare_targets(dataset, self.settings)
                     await self._update(run_id, stage="candidate_search", progress=20, warnings=dataset.warnings)
                     discovered, warnings = await asyncio.to_thread(find_candidates, dataset, self.settings)
-                    local_candidates = discovered.candidates
+                    local_candidates = merge_candidate_groups(dataset.base_candidates, discovered.candidates)
+                    if dataset.base_candidates:
+                        discovered.notices = [NoticeWithTru(
+                            **notice.model_dump(), tru=[item for item in dataset.tru if item.lot_id == notice.lot_id],
+                        ) for notice in dataset.notices]
                     local_warnings = list(warnings)
 
-                    async def save_progress(web_candidates, stats, web_warnings):
+                    async def save_progress(web_candidates, stats, web_warnings, relevance=None):
                         nonlocal warnings
                         discovered.candidates = merge_candidate_groups(local_candidates, web_candidates)
                         discovered.search_stats = list(stats)
+                        discovered.relevance = relevance
                         warnings = list(dict.fromkeys([*local_warnings, *web_warnings]))
                         if discovered.candidates:
                             warnings = [warning for warning in warnings
@@ -75,7 +121,7 @@ class ProcurementPipeline:
                         )
 
                     await save_progress([], [], [])
-                    await discover_web_candidates(dataset, self.settings, on_progress=save_progress)
+                    await discover_offers(dataset, self.settings, on_progress=save_progress)
                     await self._update(run_id, stage="saving_candidates", progress=90, warnings=warnings)
                     async with self.sessions() as session:
                         await candidate_repository.save_candidates(session, run_id, discovered)

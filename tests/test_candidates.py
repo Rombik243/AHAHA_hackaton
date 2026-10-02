@@ -352,7 +352,7 @@ def test_candidate_api_export_contract_and_run_isolation(candidate_client):
     match = candidate["matches"][0]
     assert match["target_lot_id"] == "0001" and match["lot_id"] == "0002"
     assert match["supplier_kpp"] == "001234567" and match["is_winner"] is False
-    forbidden_fields = {"score", "rank", "base_score", "history_bonus", "relevance"}
+    forbidden_fields = {"score", "rank", "base_score", "history_bonus"}
     def keys(value):
         if isinstance(value, dict):
             return set(value) | set().union(*(keys(v) for v in value.values()))
@@ -360,7 +360,7 @@ def test_candidate_api_export_contract_and_run_isolation(candidate_client):
             return set().union(*(keys(v) for v in value))
         return set()
     assert not keys(result) & forbidden_fields
-    exported = candidate_client.get(f"/runs/{run_id}/export")
+    exported = candidate_client.get(f"/runs/{run_id}/export?layout=matches")
     assert exported.status_code == 200
     assert exported.content.startswith(b"\xef\xbb\xbf")
     reader = csv.DictReader(io.StringIO(exported.content.decode("utf-8-sig")), delimiter=";")
@@ -412,7 +412,7 @@ def test_candidate_export_escapes_formula_and_preserves_quotes(candidate_client)
         suppliers=[["target", "0123456789", "", ""]],
     ))
     run_id = response.json()["run_id"]
-    export = candidate_client.get(f"/runs/{run_id}/export")
+    export = candidate_client.get(f"/runs/{run_id}/export?layout=matches")
     row = next(csv.DictReader(io.StringIO(export.content.decode("utf-8-sig")), delimiter=";"))
     assert row["procedure_name"] == '\'=HYPERLINK("x"); y'
     assert row["supplier_kpp"] == row["is_winner"] == ""
@@ -428,34 +428,30 @@ def test_bulk_search_all_ten_notices_after_extraction_failure(candidate_client, 
     """Regression for run 8: one failed page must not leave nine notices unsearched."""
     settings = candidate_client.app.state.settings
     settings.llm_enabled = True
+    settings.max_queries_per_iteration = 1
+    settings.page_archive_path = __import__("pathlib").Path(settings.database_url.split("///", 1)[1]).parent / "archive"
     settings.search_result_limit = 1  # Discovery/export must not use this as a candidate top-k.
-    queries = []
     snapshots = []
     from app.repositories.candidates import save_candidates
+    from tests.offer_fakes import fake_inn, install_backend, raw_offer, sentence
+    from app.schemas.offers import OfferExtraction
 
     async def save(session, run_id, result):
         snapshots.append((len(result.candidates), len(result.search_stats)))
         await save_candidates(session, run_id, result)
 
-    class Provider:
-        async def search(self, query):
-            queries.append(query)
-            index = int(query.split("товар-")[1][:2])
-            return [SearchResult(url=f"https://supplier.example/fail-{index}")] * (index == 0) + [
-                SearchResult(url=f"https://supplier.example/{index}"),
-                SearchResult(url="https://supplier.example/common"),
-                SearchResult(url="demo://company", is_demo=True),
-            ]
-
-    async def extract(page, **kwargs):
-        slug = page.url.rsplit("/", 1)[-1]
-        if slug.startswith("fail"):
-            raise OllamaError("temporary invalid model response")
-        inn = "0123456789" if slug == "common" else str(1234567800 + int(slug))
-        return SupplierParsedData(name='ООО "Бумага; A4"', inn=inn, website=page.url), page.url, "", f"ИНН {inn}; КПП 001234567"
-
-    monkeypatch.setattr("app.services.candidate_search.create_web_search_provider", lambda settings: Provider())
-    monkeypatch.setattr("app.services.candidate_search.extract_supplier_page", extract)
+    def search(query):
+        index = int(query.split("товар-")[1][:2])
+        return [SearchResult(url="https://supplier.example/fail")] * (index == 0) + [
+            SearchResult(url=f"https://supplier.example/{index + 1}"),
+            SearchResult(url="https://supplier.example/99"), SearchResult(url="demo://company", is_demo=True)]
+    pages = {f"https://supplier.example/{i}": sentence(i) for i in [*range(1, 11), 99]}
+    pages["https://supplier.example/fail"] = OSError("offline download failure")
+    def extract(data):
+        f = data["fragments"][0]
+        index = int(f["source_url"].rsplit("/", 1)[1])
+        return OfferExtraction.model_validate({"offers": [raw_offer(f, f["text"], index)]})
+    calls = install_backend(monkeypatch, pages, search=search, extractor=extract)
     monkeypatch.setattr("app.agent.pipeline.candidate_repository.save_candidates", save)
     uploads = files(notices=[notice(f"lot-{i}", f"товар-{i:02d}") for i in range(10)])
     uploads.pop("suppliers")  # No supplier upload is needed for either new route.
@@ -466,25 +462,26 @@ def test_bulk_search_all_ten_notices_after_extraction_failure(candidate_client, 
     assert created["mode"] == "suppliers_bulk"
     result = candidate_client.get(created["results_url"]).json()
     assert result["run"]["status"] == "completed", result
-    assert len(queries) == len(result["notices"]) == len(result["search_stats"]) == 10
+    assert len(calls["search"]) == len(result["notices"]) == len(result["search_stats"]) == 10
     assert len(result["candidates"]) == 11
     assert result["search_stats"][0]["status"] == "partial"
     assert result["search_stats"][0]["extraction_errors"] == 1
     assert all(stat["candidates_found"] == 2 for stat in result["search_stats"])
     assert (2, 1) in snapshots and (11, 10) in snapshots  # Partial results saved before completion.
-    assert any("Ollama extraction failed" in warning for warning in result["run"]["warnings"])
-    pooled = csv_rows(candidate_client.get(created["export_url"]))
+    assert any("extraction_errors=1" in warning for warning in result["run"]["warnings"])
+    pooled = csv_rows(candidate_client.get(created["export_url"] + "?layout=pool"))
     assert len(pooled) == len({row["supplier_inn"] for row in pooled}) == 11
     assert not {"score", "rank", "base_score", "history_bonus"} & set(pooled[0])
-    common = next(row for row in pooled if row["supplier_inn"] == "0123456789")
-    assert common["supplier_name"] == 'ООО "Бумага; A4"'
-    assert common["supplier_kpp"] == "001234567"
+    common = next(row for row in pooled if row["supplier_inn"] == fake_inn(99))
+    assert common["supplier_name"] == 'ООО Фиктивный-99'
     assert len(json.loads(common["matches"])) == len(json.loads(common["target_notices"])) == 10
     assert set(json.loads(common["target_lot_ids"])) == {f"lot-{i}" for i in range(10)}
     assert len(json.loads(common["sources"])) == 1
     detailed = csv_rows(candidate_client.get(created["export_url"] + "?layout=matches"))
     assert len(detailed) == 20
-    assert all(row["search_query"] and row["is_winner"] == "" for row in detailed)
+    assert all(row["is_winner"] == "" for row in detailed)
+    assert len(csv_rows(candidate_client.get(created["export_url"]))) == 20
+    assert len(csv_rows(candidate_client.get(created["export_url"] + "?layout=audit"))) == 1
 
 
 def test_pool_retains_conflicting_observations_and_all_inns(candidate_client):
@@ -525,7 +522,7 @@ def test_single_user_search_is_scoped_and_does_not_reuse_bulk_results(candidate_
     assert [item["supplier_inn"] for item in result["candidates"]] == ["0123456789"]
     assert result["candidates"][0]["matches"][0]["matched_by"] == ["text"]
     assert result["search_stats"][0]["status"] == "unavailable"
-    rows = csv_rows(candidate_client.get(body["export_url"]))
+    rows = csv_rows(candidate_client.get(body["export_url"] + "?layout=matches"))
     assert len(rows) == 1 and rows[0]["target_lot_id"] == "user-query"
     assert not {"score", "rank", "base_score", "history_bonus"} & set(rows[0])
     empty = candidate_client.post("/suppliers/search", json={"query": "Ксилофон"}).json()

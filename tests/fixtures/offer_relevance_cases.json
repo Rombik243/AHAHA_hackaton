@@ -1,0 +1,62 @@
+{
+  "description": "Synthetic offline acceptance corpus. Expected labels authored explicitly during development, not generated from parser decisions. Codex-authored fixtures; not independently annotated human ML ground truth.",
+  "cases": [
+    {
+      "id": "paper_match", "expected": "relevant",
+      "text": "Продавец товара Бумага A4: ООО Фиктивный-1, ИНН 9900000017. Бумага A4: материал целлюлоза. Доставка товара Бумага A4 в Санкт-Петербург без ограничений. ОКПД2 товара Бумага A4: 17.12.14.110.",
+      "product": "Бумага A4", "offer_type": "product", "okpd2": "17.12.14.110", "region": "Санкт-Петербург",
+      "attributes": [{"name": "материал", "value": "целлюлоза"}],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Бумага A4", "observed_okpd2_codes": ["17.12.14.110"], "geography": ["Санкт-Петербург"]}
+    },
+    {
+      "id": "wrong_product", "expected": "irrelevant",
+      "text": "Продавец товара Арматура стальная: ООО Фиктивный-1, ИНН 9900000017. Арматура стальная предназначена для железобетона, материал сталь. Доставка товара Арматура стальная в Санкт-Петербург. ОКПД2 24.10.62.110.",
+      "product": "Бумага A4", "offer_type": "product", "okpd2": "17.12.14.110", "region": "Санкт-Петербург", "attributes": [],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Арматура стальная", "observed_okpd2_codes": ["24.10.62.110"], "geography": ["Санкт-Петербург"]}
+    },
+    {
+      "id": "office_is_not_delivery", "expected": "needs_review",
+      "text": "Продавец товара Бумага A4: ООО Фиктивный-1, ИНН 9900000017. Адрес офиса компании: Санкт-Петербург. Сведения о доставке товара не опубликованы.",
+      "product": "Бумага A4", "offer_type": "product", "okpd2": null, "region": "Санкт-Петербург", "attributes": [],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Бумага A4", "observed_okpd2_codes": [], "geography": []}
+    },
+    {
+      "id": "aggregator_owner", "expected": "needs_review",
+      "text": "Каталог предложений. Бумага A4. Продавец товара не указан. Владелец платформы ООО Каталог, ИНН 9900000017. Рекламодатель ООО Реклама, ИНН 9900000024. Платформа товары не продаёт. География работы платформы: Россия.",
+      "product": "Бумага A4", "offer_type": "product", "okpd2": null, "region": "Санкт-Петербург", "attributes": [],
+      "expected_fields": {"supplier_inn": null, "product_name": "Бумага A4", "observed_okpd2_codes": [], "geography": []}
+    },
+    {
+      "id": "required_attribute_missing", "expected": "needs_review",
+      "text": "Продавец товара Бумага A4: ООО Фиктивный-1, ИНН 9900000017. Доставка товара Бумага A4 в Санкт-Петербург. Плотность бумаги не указана.",
+      "product": "Бумага A4", "offer_type": "product", "okpd2": "17.12", "region": "Санкт-Петербург",
+      "attributes": [{"name": "плотность", "value": "80", "unit": "г/м²"}],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Бумага A4", "observed_okpd2_codes": [], "geography": ["Санкт-Петербург"]}
+    },
+    {
+      "id": "service_excluded_city", "expected": "irrelevant",
+      "text": "Исполнитель услуги Уборка офиса: ООО Фиктивный-1, ИНН 9900000017. Услуга Уборка офиса оказывается только в Москве. В Санкт-Петербурге услугу не оказываем.",
+      "product": "Уборка офиса", "offer_type": "service", "okpd2": null, "region": "Санкт-Петербург", "attributes": [],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Уборка офиса", "observed_okpd2_codes": [], "geography": ["Москве"]}
+    },
+    {
+      "id": "bad_checksum", "expected": "needs_review",
+      "text": "Продавец товара Бумага A4: ООО Ошибка, ИНН 9900000019. Доставка товара Бумага A4 в Санкт-Петербург.",
+      "product": "Бумага A4", "offer_type": "product", "okpd2": null, "region": "Санкт-Петербург", "attributes": [],
+      "expected_fields": {"supplier_inn": null, "product_name": "Бумага A4", "observed_okpd2_codes": [], "geography": ["Санкт-Петербург"]}
+    },
+    {
+      "id": "material_mismatch", "expected": "irrelevant",
+      "text": "Продавец товара Коробка: ООО Фиктивный-1, ИНН 9900000017. Коробка: материал пластик. Доставка товара Коробка в Санкт-Петербург.",
+      "product": "Коробка", "offer_type": "product", "okpd2": null, "region": "Санкт-Петербург",
+      "attributes": [{"name": "материал", "value": "картон"}],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Коробка", "observed_okpd2_codes": [], "geography": ["Санкт-Петербург"]}
+    },
+    {
+      "id": "service_match", "expected": "relevant",
+      "text": "Исполнитель услуги Уборка офиса: ООО Фиктивный-1, ИНН 9900000017. Услуга Уборка офиса оказывается в Санкт-Петербурге без ограничений. ОКПД2 услуги Уборка офиса: 81.21.10.000.",
+      "product": "Уборка офиса", "offer_type": "service", "okpd2": "81.21", "region": "Санкт-Петербург", "attributes": [],
+      "expected_fields": {"supplier_inn": "9900000017", "product_name": "Уборка офиса", "observed_okpd2_codes": ["81.21.10.000"], "geography": ["Санкт-Петербурге"]}
+    }
+  ]
+}

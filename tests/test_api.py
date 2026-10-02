@@ -72,6 +72,26 @@ def test_invalid_json_fails_run_without_breaking_api(client):
     assert client.get("/health").status_code == 200
 
 
+def test_test_mode_hard_run_deadline_marks_timed_out_and_preserves_partial_api(client, monkeypatch):
+    import asyncio
+    client.app.state.settings.test_mode = True
+    client.app.state.settings.max_run_seconds = 0.05
+
+    async def slow_run(run_id):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(client.app.state.pipeline, "_run_with_lock", slow_run)
+    run_id = submit(client, b'{"lots": []}')
+    status = client.get(f"/runs/{run_id}").json()
+    assert status["status"] == "completed"
+    assert status["stage"] == "partial_timeout"
+    assert status["progress"] < 100
+    assert status["error"] is None
+    assert any("MAX_RUN_SECONDS=0.05" in warning for warning in status["warnings"])
+    assert client.get("/health").json()["test_mode"] is True
+    assert client.get("/health").json()["max_run_seconds"] == 0.05
+
+
 def test_upload_validation_and_missing_runs(client):
     assert client.post("/runs", files={"file": ("x.exe", b"abc")}).status_code == 415
     assert client.post("/runs", files={"file": ("x.json", b"")}).status_code == 422

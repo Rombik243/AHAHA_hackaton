@@ -22,6 +22,8 @@ from app.services.dataset_parser import parse_bool, parse_kpp, valid_code, valid
 from app.services.fact_extractor import extract_supplier_page
 from app.services.history_search import _load_rows, _okpd2_affinity, _string
 from app.services.web_search import create_web_search_provider
+from app.services.supplier_observations import add_observations, profile_observations, refresh_fields
+from app.schemas.candidates import SupplierEnrichmentStatus, SupplierObservation
 
 logger = logging.getLogger(__name__)
 DiscoveryProgress = Callable[[list[SupplierCandidate], list[NoticeSearchStats], list[str]], Awaitable[None]]
@@ -159,6 +161,7 @@ def find_candidates(dataset: ProcurementDataset, settings: Settings) -> tuple[Ca
         matrix = None
 
     candidates: dict[str, SupplierCandidate] = {}
+    observed_at = datetime.now(timezone.utc)
     notices = []
     for target in targets:
         notice = target.notice
@@ -195,8 +198,14 @@ def find_candidates(dataset: ProcurementDataset, settings: Settings) -> tuple[Ca
                 reasons.append("text")
             for participant in doc.participants:
                 candidate = candidates.setdefault(participant.supplier_inn, SupplierCandidate(
-                    supplier_inn=participant.supplier_inn, matches=[],
+                    supplier_inn=participant.supplier_inn, matches=[], origins=["preloaded"],
+                    enrichment=SupplierEnrichmentStatus(status="unavailable"),
                 ))
+                add_observations(candidate, [SupplierObservation(
+                    type=kind, value=value, origin="preloaded", method="upload", status="input_provided",
+                    source=participant.source.model_copy(update={"quote": value, "observed_at": observed_at}),
+                ) for kind, value in (("inn", participant.supplier_inn), ("kpp", participant.supplier_kpp)) if value])
+                refresh_fields(candidate, "Supplier-specific web enrichment was not requested; source records retained")
                 candidate.matches.append(CandidateMatch(
                     target_lot_id=notice.lot_id, target_procedure_id=notice.procedure_id,
                     target_reqnum=notice.reqnum, lot_id=doc.lot_id,
@@ -328,7 +337,12 @@ async def discover_web_candidates(
                 found_inns.add(profile.inn)
                 candidate = candidates.setdefault(profile.inn, SupplierCandidate(
                     supplier_inn=profile.inn, supplier_name=profile.name, website=None, matches=[],
+                    origins=["parser_discovered"], enrichment=SupplierEnrichmentStatus(status="completed"),
                 ))
+                add_observations(candidate, profile_observations(
+                    profile, page_url, page_text, "parser_discovered", observed_at_by_url[match.url],
+                ))
+                refresh_fields(candidate)
                 candidate.supplier_name = candidate.supplier_name or profile.name
                 candidate.matches.append(CandidateMatch(
                     target_lot_id=notice.lot_id, target_procedure_id=notice.procedure_id,

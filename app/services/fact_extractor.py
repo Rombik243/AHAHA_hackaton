@@ -2,6 +2,7 @@
 import asyncio
 import ipaddress
 import logging
+import json
 import re
 import socket
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -16,6 +17,42 @@ from app.schemas.domain import CompanyCandidate, Contract, FactData, Value
 from app.schemas.supplier import DownloadedPage, SupplierParsedData
 from app.services.supplier_extractor import extract_supplier
 from app.services.web_search import SearchResult
+from dataclasses import dataclass, field
+
+
+@dataclass
+class FetchedPage:
+    url: str
+    title: str
+    text: str
+    json_ld: list = field(default_factory=list)
+    links: list[str] = field(default_factory=list)
+    completeness_reasons: list[str] = field(default_factory=list)
+
+
+def parse_page_html(url: str, html: str) -> FetchedPage:
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    structured, reasons = [], []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            structured.append(json.loads(script.string or script.get_text()))
+        except (ValueError, TypeError):
+            reasons.append("invalid_json_ld")
+    links = list(dict.fromkeys(urljoin(url, a["href"]).split("#")[0]
+                              for a in soup.find_all("a", href=True)))
+    if soup.find(attrs={"id": re.compile(r"^(app|root|__next|__nuxt)$", re.I)}) or soup.find("noscript"):
+        reasons.append("possible_dynamic_content")
+    if soup.find("script"):
+        reasons.append("scripts_not_executed")
+    for element in soup(["script", "style", "noscript", "nav"]):
+        element.decompose()
+    text = soup.get_text(" ", strip=True)
+    if len(text) < 100:
+        reasons.append("sparse_html")
+    if re.search(r"captcha|access denied|проверка браузера|доступ запрещен", text, re.I):
+        reasons.append("possible_access_challenge")
+    return FetchedPage(url, title, text, structured, links, list(dict.fromkeys(reasons)))
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +92,8 @@ async def validate_public_url(url: str) -> None:
         raise ValueError("Non-public IP address")
 
 
-async def fetch_page(url: str, settings: Settings) -> tuple[str, str, str]:
-    """Return the final URL, title and plain text; snippets are not page evidence."""
+async def fetch_page_document(url: str, settings: Settings) -> FetchedPage:
+    """Bounded public download shared by legacy extraction and offer auditing."""
     async with asyncio.timeout(settings.request_timeout):
         async with httpx.AsyncClient(timeout=settings.request_timeout, follow_redirects=False, trust_env=False) as client:
             for _ in range(5):
@@ -82,14 +119,14 @@ async def fetch_page(url: str, settings: Settings) -> tuple[str, str, str]:
                     except LookupError:
                         decoded = body.decode("utf-8", errors="replace")
                     if "text/plain" in content_type:
-                        return url, "", decoded
-                    soup = BeautifulSoup(decoded, "html.parser")
-                    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-                    # Footer text often contains company requisites and contacts.
-                    for element in soup(["script", "style", "noscript", "nav"]):
-                        element.decompose()
-                    return url, title, soup.get_text(" ", strip=True)
+                        return FetchedPage(url, "", decoded)
+                    return parse_page_html(url, decoded)
             raise ValueError("Too many redirects")
+
+
+async def fetch_page(url: str, settings: Settings) -> tuple[str, str, str]:
+    page = await fetch_page_document(url, settings)
+    return page.url, page.title, page.text
 
 
 def _normalize(value: str) -> str:

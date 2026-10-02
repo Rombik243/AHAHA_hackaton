@@ -2,6 +2,7 @@
 import csv
 import io
 import re
+import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -46,6 +47,16 @@ def parse_date(value: str | None) -> datetime | None:
     raise ValueError(f"Invalid publish_date: {value!r}")
 
 
+def parse_procurement_system(value: str | None) -> bool | str | None:
+    # Actual 24–25 files contain a system name, while older clients send booleans.
+    if value is None:
+        return None
+    try:
+        return parse_bool(value)
+    except ValueError:
+        return value
+
+
 def parse_price(value: str | None) -> Decimal | None:
     if value is None:
         return None
@@ -68,13 +79,13 @@ def valid_code(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9]{2}(?:\.[0-9]{2}(?:\.[0-9]{1,2}(?:\.[0-9]{3})?)?)?", value))
 
 
-def read_rows(content: bytes, filename: str, fields: tuple[str, ...]):
+def read_rows(content: bytes, filename: str, fields: tuple[str, ...], optional: tuple[str, ...] = ()):
     reader = csv.DictReader(io.StringIO(_decode(content), newline=""), delimiter=";", strict=True)
     try:
         header = [field.strip() for field in reader.fieldnames or []]
     except csv.Error as exc:
         raise ValueError(f"{filename}: invalid CSV header ({exc})") from exc
-    if len(header) != len(set(header)) or set(header) != set(fields):
+    if len(header) != len(set(header)) or not set(fields) <= set(header) or set(header) - set(fields) - set(optional):
         raise ValueError(f"{filename}: expected unique columns separated by ';': {', '.join(fields)}")
     reader.fieldnames = header
     try:
@@ -94,12 +105,12 @@ def read_rows(content: bytes, filename: str, fields: tuple[str, ...]):
 def parse_dataset(files: dict[str, tuple[str, bytes]], target_lot_ids: list[str] | None = None) -> ProcurementDataset:
     notices, tru, suppliers, warnings = [], [], [], []
     notice_by_id = {}
-    for row, source in read_rows(files["notices"][1], files["notices"][0], NOTICE_FIELDS):
+    for row, source in read_rows(files["notices"][1], files["notices"][0], NOTICE_FIELDS, ("delivery_region",)):
         try:
             row["publish_date"] = parse_date(row["publish_date"])
             row["start_price"] = parse_price(row["start_price"])
-            for field in ("is_smp", "is_eshop_or_aisgz"):
-                row[field] = parse_bool(row[field])
+            row["is_smp"] = parse_bool(row["is_smp"])
+            row["is_eshop_or_aisgz"] = parse_procurement_system(row["is_eshop_or_aisgz"])
             if row["customer_inn"] is not None and not valid_inn(row["customer_inn"]):
                 raise ValueError("Invalid customer_inn: expected 10 or 12 digits, not all zero")
             row["customer_kpp"] = parse_kpp(row["customer_kpp"])
@@ -117,13 +128,20 @@ def parse_dataset(files: dict[str, tuple[str, bytes]], target_lot_ids: list[str]
         raise ValueError("The notices file has no notices")
 
     seen_items = set()
-    for row, source in read_rows(files["tru"][1], files["tru"][0], TRU_FIELDS):
+    for row, source in read_rows(files["tru"][1], files["tru"][0], TRU_FIELDS, ("target_item_id", "offer_type", "attributes")):
         if row["okpd2_code"] is not None and not valid_code(row["okpd2_code"]):
             warnings.append(f"{source.file}, record {source.row}: invalid OKPD2 omitted; product text retained.")
             row["okpd2_code"] = None
-        key = tuple(row[field] for field in TRU_FIELDS)
+        key = tuple(row.items()) if row.get("target_item_id") else (source.file, source.row)
         if key not in seen_items:
-            tru.append(TruItem(**row, source=source))
+            try:
+                row["attributes"] = json.loads(row["attributes"]) if row.get("attributes") else []
+                item = TruItem(**row, source=source)
+                if len({a.name.casefold() for a in item.attributes}) != len(item.attributes):
+                    raise ValueError("Attribute names must be unique")
+                tru.append(item)
+            except ValueError as exc:
+                raise ValueError(f"{source.file}, record {source.row}: {exc}") from exc
             seen_items.add(key)
 
     seen_participants = set()

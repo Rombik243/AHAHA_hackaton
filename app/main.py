@@ -49,7 +49,9 @@ def create_app(
 
     @application.get("/health", tags=["Health"])
     async def health():
-        return {"status": "ok", "web_search_provider": settings.web_search_provider, "llm_enabled": settings.llm_enabled}
+        return {"status": "ok", "web_search_provider": settings.web_search_provider,
+                "llm_enabled": settings.llm_enabled, "test_mode": settings.test_mode,
+                "max_run_seconds": settings.max_run_seconds if settings.test_mode else None}
 
     return application
 
